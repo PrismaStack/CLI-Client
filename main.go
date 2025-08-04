@@ -15,7 +15,7 @@ import (
 
 func main() {
 	// --- Configuration ---
-	serverBaseURL := "http://localhost:8081"
+	serverBaseURL := "https://chat.sarahsforge.dev:443"
 	fmt.Printf("Attempting to connect to server at %s\n", serverBaseURL)
 
 	client := tui.NewApiClient(serverBaseURL)

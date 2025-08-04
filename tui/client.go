@@ -13,7 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// --- Server Data Models (unchanged) ---
+// --- Server Data Models ---
 
 type User struct {
 	ID        int64  `json:"id"`
@@ -57,7 +57,7 @@ type ApiClient struct {
 	baseURL    string
 	httpClient *http.Client
 	User       *User
-	wsConn     *websocket.Conn // The persistent WebSocket connection
+	wsConn     *websocket.Conn
 }
 
 func NewApiClient(baseURL string) *ApiClient {
@@ -66,8 +66,6 @@ func NewApiClient(baseURL string) *ApiClient {
 		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}
 }
-
-// Login, GetCategories, GetMessages, SendMessage are unchanged.
 
 func (c *ApiClient) Login(username, password string) error {
 	creds := map[string]string{"username": username, "password": password}
@@ -148,8 +146,6 @@ func (c *ApiClient) SendMessage(channelID, userID int64, content string) error {
 	return nil
 }
 
-// UPDATED: This method now establishes a single, long-lived connection
-// and runs a loop to continuously listen for messages.
 func (c *ApiClient) ConnectAndListen(program *tea.Program) {
 	if c.User == nil {
 		program.Send(errOccurredMsg{fmt.Errorf("must be logged in to connect")})
@@ -161,36 +157,74 @@ func (c *ApiClient) ConnectAndListen(program *tea.Program) {
 		program.Send(errOccurredMsg{err})
 		return
 	}
-	u.Scheme = "ws"
+
+	// Set WebSocket scheme (ws or wss)
+	if u.Scheme == "https" {
+		u.Scheme = "wss"
+	} else {
+		u.Scheme = "ws"
+	}
+
+	// Remove default ports
+	if (u.Scheme == "ws" && u.Port() == "80") || (u.Scheme == "wss" && u.Port() == "443") {
+		u.Host = u.Hostname()
+	}
+
 	u.Path = "/api/ws"
 	q := u.Query()
 	q.Set("user_id", fmt.Sprintf("%d", c.User.ID))
 	u.RawQuery = q.Encode()
 
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	// Set required headers
+	headers := http.Header{}
+	headers.Add("Origin", c.baseURL)
+	headers.Add("Sec-WebSocket-Protocol", "chat")
+
+	// Connect to WebSocket
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), headers)
 	if err != nil {
 		program.Send(errOccurredMsg{fmt.Errorf("websocket dial error: %w", err)})
 		return
 	}
-	c.wsConn = conn
-	defer c.wsConn.Close()
+	defer conn.Close()
 
-	// This is the single, long-running listener loop.
+	c.wsConn = conn
+
+	// Ping handler to keep connection alive
+	conn.SetPingHandler(func(appData string) error {
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(10*time.Second))
+	})
+
+	// Start ping loop
+	go func() {
+		ticker := time.NewTicker(25 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					program.Send(errOccurredMsg{fmt.Errorf("websocket ping failed: %w", err)})
+					return
+				}
+			}
+		}
+	}()
+
+	// Main message loop
 	for {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			// When the connection closes, the loop will exit.
-			// We can send a final error message if we want.
-			program.Send(errOccurredMsg{fmt.Errorf("websocket disconnected: %w", err)})
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				program.Send(errOccurredMsg{fmt.Errorf("websocket read error: %w", err)})
+			}
 			return
 		}
 
 		var wsMsgData WebSocketMessage
 		if err := json.Unmarshal(message, &wsMsgData); err != nil {
-			continue // Ignore messages we can't parse
+			continue
 		}
-		// Send the message to the Bubble Tea program's update loop.
-		// program.Send is thread-safe.
 		program.Send(wsMsg{wsMsgData})
 	}
 }
