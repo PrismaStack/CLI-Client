@@ -24,7 +24,8 @@ func main() {
 	flag.StringVar(&flagPassword, "password", "", "Password to log in with")
 	flag.Parse()
 
-	serverBaseURL := "https://chat.sarahsforge.dev:443"
+//	serverBaseURL := "https://chat.sarahsforge.dev:443"
+	serverBaseURL := "http://localhost:8081"
 	fmt.Printf("Attempting to connect to server at %s\n", serverBaseURL)
 
 	client := tui.NewApiClient(serverBaseURL)

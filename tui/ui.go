@@ -165,7 +165,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			content := strings.TrimSpace(m.textInput.Value())
 			if content != "" && len(m.channels) > 0 {
 				activeChannel := m.channels[m.activeTabIndex]
-				err := m.client.SendMessage(activeChannel.ID, m.client.User.ID, content)
+				// FIX: Call SendMessage without the user ID, as it's now inferred from the token.
+				err := m.client.SendMessage(activeChannel.ID, content)
 				if err != nil {
 					m.err = fmt.Errorf("send failed: %w", err)
 				}

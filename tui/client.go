@@ -13,7 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// --- Server Data Models ---
+// --- Server Data Models (Unchanged) ---
 
 type User struct {
 	ID        int64  `json:"id"`
@@ -57,7 +57,9 @@ type ApiClient struct {
 	baseURL    string
 	httpClient *http.Client
 	User       *User
-	wsConn     *websocket.Conn
+	// FIX: Added a field to store the authentication token.
+	token  string
+	wsConn *websocket.Conn
 }
 
 func NewApiClient(baseURL string) *ApiClient {
@@ -67,6 +69,7 @@ func NewApiClient(baseURL string) *ApiClient {
 	}
 }
 
+// Login handles the authentication and stores the received token.
 func (c *ApiClient) Login(username, password string) error {
 	creds := map[string]string{"username": username, "password": password}
 	body, err := json.Marshal(creds)
@@ -83,19 +86,52 @@ func (c *ApiClient) Login(username, password string) error {
 		return err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("login failed with status: %s", resp.Status)
 	}
-	var user User
-	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
-		return err
+
+	// FIX: Decode the new flat response that includes the token.
+	var loginResponse struct {
+		User
+		Token string `json:"token"`
 	}
-	c.User = &user
+
+	if err := json.NewDecoder(resp.Body).Decode(&loginResponse); err != nil {
+		return fmt.Errorf("failed to decode login response: %w", err)
+	}
+
+	c.User = &loginResponse.User
+	c.token = loginResponse.Token
+
+	if c.token == "" {
+		return fmt.Errorf("login successful, but no token was received from server")
+	}
+
 	return nil
 }
 
+// FIX: newAuthenticatedRequest is a helper to build requests with the auth token.
+func (c *ApiClient) newAuthenticatedRequest(method, urlStr string, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequest(method, urlStr, body)
+	if err != nil {
+		return nil, err
+	}
+	// Add the authentication header.
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req, nil
+}
+
 func (c *ApiClient) GetCategories() ([]ChannelCategory, error) {
-	resp, err := c.httpClient.Get(c.baseURL + "/api/categories")
+	// FIX: Use the authenticated request helper.
+	req, err := c.newAuthenticatedRequest("GET", c.baseURL+"/api/categories", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +145,12 @@ func (c *ApiClient) GetCategories() ([]ChannelCategory, error) {
 
 func (c *ApiClient) GetMessages(channelID int64) ([]Message, error) {
 	url := fmt.Sprintf("%s/api/channels/%d/messages", c.baseURL, channelID)
-	resp, err := c.httpClient.Get(url)
+	// FIX: Use the authenticated request helper.
+	req, err := c.newAuthenticatedRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -118,27 +159,37 @@ func (c *ApiClient) GetMessages(channelID int64) ([]Message, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&messages); err != nil {
 		return nil, err
 	}
+	// Reverse messages to display in chronological order
 	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
 		messages[i], messages[j] = messages[j], messages[i]
 	}
 	return messages, nil
 }
 
-func (c *ApiClient) SendMessage(channelID, userID int64, content string) error {
+// SendMessage now infers the user from the token on the server side.
+// CHANGED: Removed userID from parameters.
+func (c *ApiClient) SendMessage(channelID int64, content string) error {
 	msgReq := map[string]interface{}{
 		"channel_id": channelID,
-		"user_id":    userID,
 		"content":    content,
+		// user_id is no longer needed; server gets it from the token.
 	}
 	body, err := json.Marshal(msgReq)
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient.Post(c.baseURL+"/api/messages", "application/json", bytes.NewBuffer(body))
+	// FIX: Use the authenticated request helper.
+	req, err := c.newAuthenticatedRequest("POST", c.baseURL+"/api/messages", bytes.NewBuffer(body))
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusCreated {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("failed to send message: %s - %s", resp.Status, string(bodyBytes))
@@ -147,7 +198,7 @@ func (c *ApiClient) SendMessage(channelID, userID int64, content string) error {
 }
 
 func (c *ApiClient) ConnectAndListen(program *tea.Program) {
-	if c.User == nil {
+	if c.User == nil || c.token == "" {
 		program.Send(errOccurredMsg{fmt.Errorf("must be logged in to connect")})
 		return
 	}
@@ -158,37 +209,36 @@ func (c *ApiClient) ConnectAndListen(program *tea.Program) {
 		return
 	}
 
-	// Set WebSocket scheme (ws or wss)
 	if u.Scheme == "https" {
 		u.Scheme = "wss"
 	} else {
 		u.Scheme = "ws"
 	}
 
-	// Remove default ports
+	// This logic to handle default ports is fine
 	if (u.Scheme == "ws" && u.Port() == "80") || (u.Scheme == "wss" && u.Port() == "443") {
 		u.Host = u.Hostname()
 	}
 
 	u.Path = "/api/ws"
 	q := u.Query()
-	q.Set("user_id", fmt.Sprintf("%d", c.User.ID))
+	// FIX: Use the token for WebSocket authentication instead of user_id.
+	q.Set("token", c.token)
 	u.RawQuery = q.Encode()
 
-	// Set required headers
 	headers := http.Header{}
+	// These headers aren't strictly required by the server but are good practice.
 	headers.Add("Origin", c.baseURL)
-	headers.Add("Sec-WebSocket-Protocol", "chat")
 
-	// Connect to WebSocket
 	conn, _, err := websocket.DefaultDialer.Dial(u.String(), headers)
 	if err != nil {
 		program.Send(errOccurredMsg{fmt.Errorf("websocket dial error: %w", err)})
 		return
 	}
 	defer conn.Close()
-
 	c.wsConn = conn
+
+	// Ping-pong and message reading loops are unchanged...
 
 	// Ping handler to keep connection alive
 	conn.SetPingHandler(func(appData string) error {
@@ -201,12 +251,10 @@ func (c *ApiClient) ConnectAndListen(program *tea.Program) {
 		defer ticker.Stop()
 
 		for {
-			select {
-			case <-ticker.C:
-				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					program.Send(errOccurredMsg{fmt.Errorf("websocket ping failed: %w", err)})
-					return
-				}
+			<-ticker.C
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				program.Send(errOccurredMsg{fmt.Errorf("websocket ping failed: %w", err)})
+				return
 			}
 		}
 	}()
@@ -223,7 +271,7 @@ func (c *ApiClient) ConnectAndListen(program *tea.Program) {
 
 		var wsMsgData WebSocketMessage
 		if err := json.Unmarshal(message, &wsMsgData); err != nil {
-			continue
+			continue // Ignore malformed messages
 		}
 		program.Send(wsMsg{wsMsgData})
 	}
