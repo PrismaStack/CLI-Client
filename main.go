@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -14,30 +15,47 @@ import (
 )
 
 func main() {
-	// --- Configuration ---
+	// --- Command-line flags ---
+	var (
+		flagUsername string
+		flagPassword string
+	)
+	flag.StringVar(&flagUsername, "username", "", "Username to log in with")
+	flag.StringVar(&flagPassword, "password", "", "Password to log in with")
+	flag.Parse()
+
 	serverBaseURL := "https://chat.sarahsforge.dev:443"
 	fmt.Printf("Attempting to connect to server at %s\n", serverBaseURL)
 
 	client := tui.NewApiClient(serverBaseURL)
 	reader := bufio.NewReader(os.Stdin)
 
+	username := strings.TrimSpace(flagUsername)
+	password := flagPassword
+
 	// --- Login Loop ---
 	for {
-		fmt.Print("Enter username: ")
-		username, _ := reader.ReadString('\n')
-		username = strings.TrimSpace(username)
-
-		fmt.Print("Enter password: ")
-		bytePassword, err := term.ReadPassword(int(syscall.Stdin))
-		if err != nil {
-			log.Fatalf("Failed to read password: %v", err)
+		if username == "" {
+			fmt.Print("Enter username: ")
+			rawUser, _ := reader.ReadString('\n')
+			username = strings.TrimSpace(rawUser)
 		}
-		password := string(bytePassword)
-		fmt.Println() // Newline after password input
 
-		err = client.Login(username, password)
+		if password == "" {
+			fmt.Print("Enter password: ")
+			bytePassword, err := term.ReadPassword(int(syscall.Stdin))
+			if err != nil {
+				log.Fatalf("Failed to read password: %v", err)
+			}
+			password = string(bytePassword)
+			fmt.Println()
+		}
+
+		err := client.Login(username, password)
 		if err != nil {
 			fmt.Printf("Login failed: %v. Please try again.\n", err)
+			// Reset password so it is prompted again if login fails.
+			password = ""
 			continue
 		}
 		fmt.Println("Login successful! Starting chat...")
@@ -47,9 +65,7 @@ func main() {
 	// --- Launch UI ---
 	p := tea.NewProgram(tui.InitialModel(client), tea.WithAltScreen(), tea.WithMouseAllMotion())
 
-	// UPDATED: Start the WebSocket listener.
-	// This goroutine runs in the background and sends messages (like new chats)
-	// back to the tea.Program, which will process them in the Update function.
+	// Start the WebSocket listener.
 	go client.ConnectAndListen(p)
 
 	if _, err := p.Run(); err != nil {

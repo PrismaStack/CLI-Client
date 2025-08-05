@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -26,7 +27,7 @@ var (
 	offlineUserStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
-// Model & State (unchanged)
+// Model & State (updated)
 type viewState int
 
 const (
@@ -45,6 +46,10 @@ type model struct {
 	messages       map[int64][]Message
 	onlineUsers    map[string]bool
 	activeTabIndex int
+
+	chatViewport   viewport.Model
+	viewportReady  bool
+	lastChannelID  int64
 }
 
 // Messages for Tea Program (unchanged)
@@ -64,13 +69,15 @@ func InitialModel(client *ApiClient) model {
 	ti.CharLimit = 280
 	ti.Width = 50
 
-	return model{
+	m := model{
 		client:      client,
 		state:       stateLoading,
 		textInput:   ti,
 		messages:    make(map[int64][]Message),
 		onlineUsers: make(map[string]bool),
 	}
+
+	return m
 }
 
 // Tea Commands (unchanged)
@@ -105,8 +112,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		// Adjust for user list on the right
 		m.textInput.Width = m.width - 25
+
+		// Update viewport size if needed
+		chatWidth := m.width - 25
+		chatHeight := m.height - 5
+		if chatHeight < 1 {
+			chatHeight = 1
+		}
+		if !m.viewportReady || m.chatViewport.Width != chatWidth || m.chatViewport.Height != chatHeight {
+			m.chatViewport = viewport.New(chatWidth, chatHeight)
+			m.viewportReady = true
+
+			// On resize, update viewport content for current channel
+			if len(m.channels) > 0 {
+				activeChannel := m.channels[m.activeTabIndex]
+				m.chatViewport.SetContent(m.renderMessagesContent(activeChannel.ID))
+				m.chatViewport.GotoBottom()
+			}
+		}
 
 	case tea.KeyMsg:
 		switch msg.Type {
@@ -117,6 +141,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.activeTabIndex = (m.activeTabIndex + 1) % len(m.channels)
 				if _, ok := m.messages[m.channels[m.activeTabIndex].ID]; !ok {
 					cmd = fetchHistoryCmd(m.client, m.channels[m.activeTabIndex].ID)
+				} else {
+					m.chatViewport.SetContent(m.renderMessagesContent(m.channels[m.activeTabIndex].ID))
+					m.chatViewport.GotoBottom()
 				}
 			}
 			return m, cmd
@@ -128,6 +155,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if _, ok := m.messages[m.channels[m.activeTabIndex].ID]; !ok {
 					cmd = fetchHistoryCmd(m.client, m.channels[m.activeTabIndex].ID)
+				} else {
+					m.chatViewport.SetContent(m.renderMessagesContent(m.channels[m.activeTabIndex].ID))
+					m.chatViewport.GotoBottom()
 				}
 			}
 			return m, cmd
@@ -137,11 +167,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				activeChannel := m.channels[m.activeTabIndex]
 				err := m.client.SendMessage(activeChannel.ID, m.client.User.ID, content)
 				if err != nil {
-					// This error can be displayed more prominently if desired
 					m.err = fmt.Errorf("send failed: %w", err)
 				}
 				m.textInput.Reset()
 			}
+			// Always scroll to bottom after sending
+			m.chatViewport.GotoBottom()
+		case tea.KeyUp, tea.KeyPgUp:
+			if m.viewportReady {
+				m.chatViewport.LineUp(1)
+			}
+		case tea.KeyDown, tea.KeyPgDown:
+			if m.viewportReady {
+				m.chatViewport.LineDown(1)
+			}
+		case tea.KeyHome:
+			if m.viewportReady {
+				m.chatViewport.GotoTop()
+			}
+		case tea.KeyEnd:
+			if m.viewportReady {
+				m.chatViewport.GotoBottom()
+			}
+		}
+		// Pass key to text input unless it's for viewport
+		if !isViewportScrollKey(msg) {
+			m.textInput, cmd = m.textInput.Update(msg)
+			cmds = append(cmds, cmd)
 		}
 
 	case initialDataLoadedMsg:
@@ -153,9 +205,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.channels[i].Position < m.channels[j].Position
 		})
 		if len(m.channels) > 0 {
-			// The WebSocket listener is started in main.go now.
-			// We just need to load history for the first channel.
 			cmds = append(cmds, fetchHistoryCmd(m.client, m.channels[0].ID))
+			m.lastChannelID = m.channels[0].ID
 		} else {
 			m.err = fmt.Errorf("no channels found on server")
 			m.state = stateError
@@ -163,19 +214,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case historyLoadedMsg:
 		m.messages[msg.channelID] = msg.msgs
+		m.lastChannelID = msg.channelID
+		if m.viewportReady {
+			m.chatViewport.SetContent(m.renderMessagesContent(msg.channelID))
+			m.chatViewport.GotoBottom()
+		}
 
-	// UPDATED: This case is now much simpler. It just processes the message
-	// and does NOT need to re-queue the listener command.
 	case wsMsg:
 		switch msg.msg.Event {
 		case "new_message":
 			var newMsg Message
 			if err := json.Unmarshal(msg.msg.Payload, &newMsg); err == nil {
-				// Ensure the message slice exists for this channel
 				if _, ok := m.messages[newMsg.ChannelID]; !ok {
 					m.messages[newMsg.ChannelID] = make([]Message, 0)
 				}
 				m.messages[newMsg.ChannelID] = append(m.messages[newMsg.ChannelID], newMsg)
+				if m.viewportReady && len(m.channels) > 0 && m.channels[m.activeTabIndex].ID == newMsg.ChannelID {
+					m.chatViewport.SetContent(m.renderMessagesContent(newMsg.ChannelID))
+					m.chatViewport.GotoBottom()
+				}
 			}
 		case "presence_update":
 			var users []User
@@ -191,15 +248,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errOccurredMsg:
 		m.err = msg.err
 		m.state = stateError
-		// Don't quit immediately, let the user see the error message.
 	}
 
-	m.textInput, cmd = m.textInput.Update(msg)
-	cmds = append(cmds, cmd)
+	// Always pass text input update, unless handled above
+	if cmd == nil && !isViewportScrollKey(msg) {
+		m.textInput, cmd = m.textInput.Update(msg)
+		cmds = append(cmds, cmd)
+	}
 	return m, tea.Batch(cmds...)
 }
 
-// View() and its rendering helpers are unchanged from the previous correct version.
+// Utility: detect keys for viewport scrolling
+func isViewportScrollKey(msg tea.Msg) bool {
+	km, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return false
+	}
+	switch km.Type {
+	case tea.KeyUp, tea.KeyDown, tea.KeyPgUp, tea.KeyPgDown, tea.KeyHome, tea.KeyEnd:
+		return true
+	}
+	return false
+}
+
+// View() and its rendering helpers
 
 func (m model) View() string {
 	if m.width == 0 {
@@ -217,7 +289,7 @@ func (m model) View() string {
 		chatContent.WriteString(header + "\n")
 		tabs := m.renderTabs()
 		chatContent.WriteString(tabs + "\n")
-		chatPane := m.renderMessages()
+		chatPane := m.renderMessagesViewport()
 		userPane := m.renderUserList()
 		mainContent := lipgloss.JoinHorizontal(lipgloss.Top, chatPane, userPane)
 		chatContent.WriteString(mainContent + "\n")
@@ -238,27 +310,23 @@ func (m model) renderTabs() string {
 	return lipgloss.JoinHorizontal(lipgloss.Top, renderedTabs...)
 }
 
-func (m model) renderMessages() string {
+// NEW: Use viewport for messages
+func (m model) renderMessagesViewport() string {
+	if !m.viewportReady {
+		return lipgloss.NewStyle().Width(m.width-25).Height(m.height-5).Render("Loading...")
+	}
+	return m.chatViewport.View()
+}
+
+// Helper: render messages content for viewport
+func (m model) renderMessagesContent(channelID int64) string {
 	chatWidth := m.width - 25
-	chatHeight := m.height - 5
-	if chatHeight < 1 {
-		chatHeight = 1
+	if chatWidth < 1 {
+		chatWidth = 1
 	}
-
 	var sb strings.Builder
-	if len(m.channels) == 0 {
-		return lipgloss.NewStyle().Width(chatWidth).Height(chatHeight).Render("No channels.")
-	}
-
-	activeChannel := m.channels[m.activeTabIndex]
-	msgs := m.messages[activeChannel.ID]
-	start := 0
-	if len(msgs) > chatHeight {
-		start = len(msgs) - chatHeight
-	}
-	visibleMsgs := msgs[start:]
-
-	for _, msg := range visibleMsgs {
+	msgs := m.messages[channelID]
+	for _, msg := range msgs {
 		timeStr := msg.CreatedAt.Format("15:04")
 		prefix := fmt.Sprintf("[%s] %s:", timeStr, msg.Username)
 		style := otherMsgStyle
@@ -268,8 +336,7 @@ func (m model) renderMessages() string {
 		line := fmt.Sprintf("%s %s", prefix, msg.Content)
 		sb.WriteString(style.Render(line) + "\n")
 	}
-
-	return lipgloss.NewStyle().Width(chatWidth).Height(chatHeight).Render(sb.String())
+	return sb.String()
 }
 
 func (m model) renderUserList() string {
